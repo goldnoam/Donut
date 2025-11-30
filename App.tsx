@@ -2,10 +2,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls, Environment, ContactShadows, Instance, Instances } from '@react-three/drei';
-import { GameState, DonutConfig, DonutShape, DoughFlavor, Topping, Sprinkles, Filling, Prize } from './types';
+import { GameState, DonutConfig, DonutShape, DoughFlavor, Topping, Sprinkles, Filling, Prize, PowerupType, Language } from './types';
 import { Donut3D } from './components/Donut3D';
 import { GameUI } from './components/GameUI';
 import { generatePrize } from './services/geminiService';
+import { TRANSLATIONS } from './translations';
 import * as THREE from 'three';
 
 const INITIAL_DONUT: DonutConfig = {
@@ -32,7 +33,20 @@ const INITIAL_STATE: GameState = {
   multiplier: 1,
   pendingTimeBonus: 0,
   bonusMessage: null,
-  orderStartTime: 0
+  orderStartTime: 0,
+  musicVolume: 0.5,
+  isAppLoading: true,
+  language: Language.EN, // Default Language
+  inventory: {
+    [PowerupType.TIME_FREEZE]: 2,
+    [PowerupType.DOUBLE_POINTS]: 2,
+    [PowerupType.INSTANT_COOK]: 3,
+  },
+  activeEffects: {
+    [PowerupType.TIME_FREEZE]: 0,
+    [PowerupType.DOUBLE_POINTS]: 0,
+    [PowerupType.INSTANT_COOK]: 0,
+  },
 };
 
 // 3D Confetti Particle System
@@ -77,7 +91,22 @@ const App: React.FC = () => {
   const musicGainRef = useRef<GainNode | null>(null);
   const nextNoteTimeRef = useRef<number>(0);
   const isMusicPlayingRef = useRef<boolean>(false);
+
+  // Translation Helper
+  const t = useCallback((key: string) => {
+      const lang = gameState.language;
+      const dict = TRANSLATIONS[lang] || TRANSLATIONS[Language.EN];
+      return dict[key] || key;
+  }, [gameState.language]);
   
+  // App Loading Simulation
+  useEffect(() => {
+    const timer = setTimeout(() => {
+        setGameState(prev => ({ ...prev, isAppLoading: false }));
+    }, 2500); // 2.5s loading screen
+    return () => clearTimeout(timer);
+  }, []);
+
   // Feedback cleanup timer
   useEffect(() => {
     if (gameState.lastFeedback) {
@@ -98,13 +127,31 @@ const App: React.FC = () => {
       }
   }, [gameState.bonusMessage]);
 
+  // Sync music volume with Web Audio API
+  useEffect(() => {
+      if (musicGainRef.current && audioContextRef.current) {
+          // Map 0-1 volume to 0-0.1 gain to keep background music subtle
+          const targetGain = gameState.musicVolume * 0.1;
+          musicGainRef.current.gain.setTargetAtTime(targetGain, audioContextRef.current.currentTime, 0.1);
+      }
+  }, [gameState.musicVolume]);
+
+  const handleVolumeChange = (volume: number) => {
+      setGameState(prev => ({ ...prev, musicVolume: volume }));
+  };
+
+  const handleLanguageChange = (lang: Language) => {
+      setGameState(prev => ({ ...prev, language: lang }));
+  };
+
   // Audio System
   const initAudio = () => {
     if (!audioContextRef.current) {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       audioContextRef.current = new AudioCtx();
       musicGainRef.current = audioContextRef.current.createGain();
-      musicGainRef.current.gain.value = 0.05; // Low volume for background
+      // Initialize with current state volume
+      musicGainRef.current.gain.value = gameState.musicVolume * 0.1; 
       musicGainRef.current.connect(audioContextRef.current.destination);
     }
     if (audioContextRef.current.state === 'suspended') {
@@ -112,7 +159,7 @@ const App: React.FC = () => {
     }
   };
 
-  const playSound = (type: 'win' | 'fail' | 'tick' | 'pop' | 'serve' | 'click' | 'dough' | 'glaze' | 'sprinkles' | 'filling' | 'success' | 'gameover' | 'prize' | 'bonus') => {
+  const playSound = (type: 'win' | 'fail' | 'tick' | 'pop' | 'serve' | 'click' | 'dough' | 'glaze' | 'sprinkles' | 'filling' | 'success' | 'gameover' | 'prize' | 'bonus' | 'powerup') => {
     if (gameState.isPaused && type !== 'click') return; // Allow click sound even when paused for resume button
 
     initAudio();
@@ -284,6 +331,16 @@ const App: React.FC = () => {
          osc.start(now);
          osc.stop(now + 0.3);
          break;
+      case 'powerup':
+         // Sci-fi activation
+         osc.type = 'sawtooth';
+         osc.frequency.setValueAtTime(200, now);
+         osc.frequency.linearRampToValueAtTime(800, now + 0.5);
+         gain.gain.setValueAtTime(0.2, now);
+         gain.gain.linearRampToValueAtTime(0, now + 0.5);
+         osc.start(now);
+         osc.stop(now + 0.5);
+         break;
     }
   };
 
@@ -393,9 +450,16 @@ const App: React.FC = () => {
   // Timer
   useEffect(() => {
     let interval: number;
+    // Check if Time Freeze is active
+    const isTimeFrozen = gameState.activeEffects[PowerupType.TIME_FREEZE] > Date.now();
+    const tickRate = isTimeFrozen ? 2000 : 1000; // Slow down timer if frozen
+
     if (gameState.isPlaying && !gameState.isPaused && !gameState.isGameOver && gameState.timeLeft > 0 && !gameState.prize) {
       interval = window.setInterval(() => {
         setGameState(prev => {
+          // Double check active effect in callback to avoid stale closure issues if not relying on dependency
+          // But since we key the effect on isTimeFrozen via dependency re-trigger or tickRate, it's fine.
+          
           if (prev.timeLeft <= 1) {
              playSound('gameover');
              stopMusic();
@@ -404,42 +468,44 @@ const App: React.FC = () => {
           if(prev.timeLeft <= 10) playSound('tick');
           return { ...prev, timeLeft: prev.timeLeft - 1 };
         });
-      }, 1000);
+      }, tickRate);
     }
     return () => clearInterval(interval);
-  }, [gameState.isPlaying, gameState.isPaused, gameState.isGameOver, gameState.timeLeft, gameState.prize]);
+  }, [gameState.isPlaying, gameState.isPaused, gameState.isGameOver, gameState.timeLeft, gameState.prize, gameState.activeEffects]);
 
   const startGame = () => {
     playSound('success');
     const firstOrder = generateOrder(1);
     setGameState({
       ...INITIAL_STATE,
+      isAppLoading: false, // Ensure loading is off
       isPlaying: true,
       currentOrder: firstOrder,
       timeLeft: 60,
-      orderStartTime: Date.now()
+      orderStartTime: Date.now(),
+      language: gameState.language, // Preserve language
     });
     startMusic();
   };
 
   const nextLevel = async () => {
      stopMusic(); 
-     playSound('prize');
+     playSound('win'); // Level completion sound
      setGameState(prev => ({ ...prev, isLoadingPrize: true }));
      
      const prize = await generatePrize();
      
      if (prize) {
+         playSound('prize'); // Magical Reveal Arpeggio
          setGameState(prev => ({
              ...prev,
              prize: prize,
              isLoadingPrize: false
          }));
-         playSound('win');
      } else {
          setGameState(prev => ({
             ...prev,
-            prize: { name: "Mystery Token", description: "A strange glitch in the matrix...", image: "https://picsum.photos/500" },
+            prize: { name: t('mysteryToken'), description: "A strange glitch in the matrix...", image: "https://picsum.photos/500" },
             isLoadingPrize: false
         }));
      }
@@ -480,24 +546,66 @@ const App: React.FC = () => {
     }));
   };
 
-  const handleServe = () => {
+  const handlePowerup = (type: PowerupType) => {
+      if (gameState.inventory[type] <= 0 || gameState.isPaused) return;
+
+      playSound('powerup');
+      
+      setGameState(prev => {
+          const newInventory = { ...prev.inventory, [type]: prev.inventory[type] - 1 };
+          
+          if (type === PowerupType.INSTANT_COOK && prev.currentOrder) {
+               // Schedule the serve to happen immediately after this state update
+               setTimeout(() => handleServe(true, prev.currentOrder), 50);
+               return {
+                   ...prev,
+                   inventory: newInventory,
+                   currentDonut: { ...prev.currentOrder }, // Visually match immediately
+                   bonusMessage: "autoChef"
+               };
+          } else if (type === PowerupType.TIME_FREEZE) {
+              return {
+                  ...prev,
+                  inventory: newInventory,
+                  activeEffects: { ...prev.activeEffects, [PowerupType.TIME_FREEZE]: Date.now() + 15000 },
+                  bonusMessage: "timeSlow"
+              };
+          } else if (type === PowerupType.DOUBLE_POINTS) {
+              return {
+                  ...prev,
+                  inventory: newInventory,
+                  activeEffects: { ...prev.activeEffects, [PowerupType.DOUBLE_POINTS]: Date.now() + 15000 },
+                  bonusMessage: "doublePoints"
+              };
+          }
+
+          return { ...prev, inventory: newInventory };
+      });
+  };
+
+  const handleServe = (forceSuccess = false, forcedOrder: DonutConfig | null = null) => {
     if (gameState.isPaused) return;
 
-    const { currentDonut, currentOrder, score, level, streak, multiplier, timeLeft, orderStartTime } = gameState;
+    // If forced (Powerup), use forced order, otherwise use current state
+    const currentDonut = forceSuccess && forcedOrder ? forcedOrder : gameState.currentDonut;
+    const currentOrder = forcedOrder || gameState.currentOrder;
+    
     if (!currentOrder) return;
 
-    const isCorrect = 
+    // Check match
+    const isCorrect = forceSuccess || (
         currentDonut.shape === currentOrder.shape &&
         currentDonut.dough === currentOrder.dough &&
         currentDonut.topping === currentOrder.topping &&
         currentDonut.sprinkles === currentOrder.sprinkles &&
-        currentDonut.filling === currentOrder.filling;
+        currentDonut.filling === currentOrder.filling
+    );
 
     if (isCorrect) {
         playSound('serve');
         setTimeout(() => playSound('success'), 200);
 
-        const newStreak = streak + 1;
+        const newStreak = gameState.streak + 1;
         
         // Multiplier Logic
         let newMultiplier = 1;
@@ -505,25 +613,29 @@ const App: React.FC = () => {
         else if (newStreak >= 6) newMultiplier = 3;
         else if (newStreak >= 3) newMultiplier = 2;
 
+        // Check for Double Points Powerup
+        const isDoublePoints = gameState.activeEffects[PowerupType.DOUBLE_POINTS] > Date.now();
+        if (isDoublePoints) newMultiplier *= 2;
+
         // Speed Bonus Logic
-        const timeTaken = (Date.now() - orderStartTime) / 1000;
+        const timeTaken = (Date.now() - gameState.orderStartTime) / 1000;
         let speedBonus = 0;
         let bonusMsg = null;
         
         if (timeTaken < 5) {
             speedBonus = 5;
-            bonusMsg = "⚡ SPEED BONUS! +5s";
+            bonusMsg = "speedBonus";
             playSound('bonus');
         } else if (timeTaken < 8) {
             speedBonus = 2;
-            bonusMsg = "⚡ FAST! +2s";
+            bonusMsg = "fast";
             playSound('bonus');
         }
 
-        const baseScore = (10 * level);
-        const timeScore = Math.floor(timeLeft / 2);
+        const baseScore = (10 * gameState.level);
+        const timeScore = Math.floor(gameState.timeLeft / 2);
         const orderScore = (baseScore + timeScore) * newMultiplier;
-        const newScore = score + orderScore;
+        const newScore = gameState.score + orderScore;
 
         setGameState(prev => ({ 
             ...prev, 
@@ -532,7 +644,7 @@ const App: React.FC = () => {
             streak: newStreak,
             multiplier: newMultiplier,
             pendingTimeBonus: prev.pendingTimeBonus + speedBonus,
-            bonusMessage: bonusMsg
+            bonusMessage: bonusMsg || prev.bonusMessage
         }));
         setTimeout(() => nextLevel(), 1000); 
     } else {
@@ -549,9 +661,22 @@ const App: React.FC = () => {
 
   // --- RENDERERS ---
 
+  if (gameState.isAppLoading) {
+      return (
+          <div className="h-screen w-screen bg-pink-100 flex flex-col items-center justify-center p-4">
+               <div className="relative">
+                   <div className="w-24 h-24 border-8 border-pink-200 border-t-pink-500 rounded-full animate-spin"></div>
+                   <div className="absolute inset-0 flex items-center justify-center text-3xl">🍩</div>
+               </div>
+               <h2 className="mt-8 text-2xl font-bold text-pink-600 animate-pulse">{t('loading')}</h2>
+               <p className="text-gray-500 mt-2">{t('preparing')}</p>
+          </div>
+      );
+  }
+
   if (!gameState.isPlaying && !gameState.isGameOver && !gameState.prize) {
     return (
-      <div className="h-screen w-screen bg-pink-100 flex flex-col items-center justify-center p-4 text-center overflow-hidden">
+      <div className="h-screen w-screen bg-pink-100 flex flex-col items-center justify-center p-4 text-center overflow-hidden" dir={gameState.language === Language.HE ? 'rtl' : 'ltr'}>
         <div className="absolute inset-0 z-0 opacity-20 pointer-events-none">
             <div className="absolute top-10 left-10 w-20 h-20 bg-yellow-300 rounded-full blur-xl animate-bounce"></div>
             <div className="absolute bottom-20 right-20 w-32 h-32 bg-purple-300 rounded-full blur-xl animate-pulse"></div>
@@ -559,80 +684,149 @@ const App: React.FC = () => {
         
         <h1 className="text-6xl font-black text-pink-600 mb-4 drop-shadow-white relative z-10">Donut Dash 3D</h1>
         <p className="text-xl text-gray-700 mb-8 max-w-md relative z-10">
-            Bake Hanukkah treats, beat the clock, and win magical AI-generated prizes!
+            {t('subtitle')}
         </p>
         <button 
             onClick={startGame}
             className="relative z-10 bg-gradient-to-tr from-pink-500 to-purple-500 text-white text-2xl font-bold py-4 px-12 rounded-full shadow-xl hover:scale-105 transition-transform"
         >
-            Start Baking
+            {t('start')}
         </button>
+
+        <div className="absolute bottom-5 left-0 right-0 z-20 flex flex-col items-center justify-center text-sm font-semibold text-pink-900/40 gap-1 pointer-events-auto">
+             <span>(C) Noam Gold AI 2025</span>
+             <a href="mailto:gold.noam@gmail.com" className="hover:text-pink-600 hover:underline transition-all">Send Feedback</a>
+        </div>
       </div>
     );
   }
 
   if (gameState.isGameOver) {
       return (
-        <div className="h-screen w-screen bg-red-50 flex flex-col items-center justify-center p-4 text-center">
-            <h2 className="text-5xl font-black text-red-500 mb-4">Out of Time!</h2>
-            <p className="text-2xl text-gray-800 mb-6">You reached Level {gameState.level}</p>
-            <p className="text-xl text-gray-600 mb-8">Final Score: {gameState.score}</p>
+        <div className="h-screen w-screen bg-red-50 flex flex-col items-center justify-center p-4 text-center" dir={gameState.language === Language.HE ? 'rtl' : 'ltr'}>
+            <h2 className="text-5xl font-black text-red-500 mb-4">{t('gameOver')}</h2>
+            <p className="text-2xl text-gray-800 mb-6">{t('outOfTimeMsg')} {gameState.level}</p>
+            <p className="text-xl text-gray-600 mb-8">{t('finalScore')}: {gameState.score}</p>
             <button 
                 onClick={startGame}
                 className="bg-red-500 text-white text-xl font-bold py-3 px-8 rounded-full shadow-lg hover:bg-red-600"
             >
-                Try Again
+                {t('tryAgain')}
             </button>
         </div>
       );
   }
 
   if (gameState.isLoadingPrize || gameState.prize) {
-      return (
-          <div className="h-screen w-screen bg-indigo-950 flex flex-col items-center justify-center p-4 text-center relative overflow-hidden">
-              <div className="absolute inset-0 opacity-30 bg-[url('https://www.transparenttextures.com/patterns/stardust.png')] animate-pulse"></div>
-              
-              {gameState.isLoadingPrize ? (
-                  <div className="text-white flex flex-col items-center z-20">
-                      <div className="w-20 h-20 border-t-4 border-yellow-400 border-r-4 border-purple-500 border-l-pink-500 rounded-full animate-spin mb-6"></div>
-                      <h2 className="text-3xl font-bold animate-bounce text-yellow-300">Summoning Prize...</h2>
-                      <p className="text-indigo-200 mt-2 italic">Consulting the AI spirits...</p>
+     const isLoading = gameState.isLoadingPrize;
+     
+     return (
+       <div className="h-screen w-screen bg-indigo-950 flex flex-col items-center justify-center p-4 text-center relative overflow-hidden perspective-1000" dir={gameState.language === Language.HE ? 'rtl' : 'ltr'}>
+           {/* Dynamic Background */}
+           <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-slate-900 via-indigo-950 to-black z-0"></div>
+           
+           {/* Rotating Light Beams (Spotlight Effect) */}
+           {!isLoading && (
+             <div className="absolute inset-0 flex items-center justify-center z-0 animate-[spin_20s_linear_infinite] opacity-20">
+                <div className="w-[150vmax] h-[150vmax] bg-[conic-gradient(from_0deg_at_50%_50%,transparent_0deg,white_10deg,transparent_20deg,transparent_40deg,white_50deg,transparent_60deg,transparent_80deg,white_90deg,transparent_100deg)] mix-blend-overlay"></div>
+             </div>
+           )}
+
+           {/* Stardust */}
+           <div className="absolute inset-0 opacity-40 bg-[url('https://www.transparenttextures.com/patterns/stardust.png')] animate-pulse z-0 mix-blend-screen"></div>
+
+           {isLoading ? (
+               <div className="text-white flex flex-col items-center z-20 relative">
+                  <div className="relative">
+                      <div className="w-24 h-24 border-4 border-transparent border-t-yellow-400 border-r-pink-500 rounded-full animate-spin"></div>
+                      <div className="w-16 h-16 border-4 border-transparent border-b-blue-400 border-l-purple-500 rounded-full animate-spin absolute top-4 left-4 direction-reverse"></div>
+                      <div className="absolute inset-0 flex items-center justify-center text-3xl animate-bounce">🎁</div>
                   </div>
-              ) : (
-                  <div className="z-20 flex flex-col items-center animate-in fade-in zoom-in duration-500">
-                      <div className="bg-white/10 backdrop-blur-xl p-8 rounded-[2rem] border border-white/20 shadow-2xl max-w-md w-full relative overflow-hidden">
-                          <div className="absolute -top-1/2 -left-1/2 w-[200%] h-[200%] bg-gradient-to-b from-transparent via-white/5 to-transparent rotate-45 animate-pulse pointer-events-none"></div>
+                  <h2 className="text-3xl font-bold mt-8 animate-pulse text-transparent bg-clip-text bg-gradient-to-r from-yellow-300 via-pink-300 to-blue-300">
+                    {t('prizeForging')}
+                  </h2>
+                  <p className="text-indigo-200 mt-2 font-mono text-sm opacity-75">{t('consultingOracle')}</p>
+               </div>
+           ) : (
+               <div className="z-20 flex flex-col items-center relative w-full max-w-md">
+                   {/* Reveal Burst Animation */}
+                   <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[150%] h-[150%] bg-radial-gradient(circle, rgba(255,255,255,0.8) 0%, transparent 70%) animate-ping-slow pointer-events-none opacity-0" style={{ animation: 'burst 0.8s ease-out forwards' }}></div>
 
-                          <div className="text-yellow-400 text-lg font-bold tracking-widest uppercase mb-2">Level {gameState.level} Complete!</div>
-                          
-                          <h2 className="text-3xl font-extrabold text-white mb-2 leading-tight bg-clip-text text-transparent bg-gradient-to-r from-yellow-200 to-pink-200">
-                              {gameState.prize?.name}
-                          </h2>
-                          
-                          <div className="relative aspect-square w-full bg-black/40 rounded-2xl overflow-hidden mb-6 shadow-2xl ring-4 ring-white/10 group">
-                            <img 
-                                src={gameState.prize?.image} 
-                                alt={gameState.prize?.name} 
-                                className="w-full h-full object-cover transform transition-transform duration-1000 group-hover:scale-110 hover:rotate-1" 
-                            />
-                             <div className="absolute inset-0 shadow-[inset_0_0_50px_rgba(0,0,0,0.5)]"></div>
-                          </div>
+                   {/* Confetti Rain */}
+                    <div className="absolute -top-20 left-1/2 -translate-x-1/2 w-full h-[120vh] pointer-events-none overflow-hidden z-30">
+                        {Array.from({ length: 40 }).map((_, i) => (
+                            <div key={i} className="absolute w-2 h-4" style={{
+                                left: `${Math.random() * 100}%`,
+                                top: `-10%`,
+                                backgroundColor: ['#FFD700', '#60A5FA', '#F472B6', '#FBBF24'][Math.floor(Math.random() * 4)],
+                                animation: `confetti-drop ${2 + Math.random() * 3}s linear infinite`,
+                                animationDelay: `${Math.random() * 2}s`,
+                                transform: `rotate(${Math.random() * 360}deg)`
+                            }}></div>
+                        ))}
+                    </div>
 
-                          <p className="text-gray-200 mb-8 italic text-lg leading-relaxed font-serif">
-                              "{gameState.prize?.description}"
-                          </p>
+                   {/* The Card */}
+                   <div className="bg-white/10 backdrop-blur-2xl p-1 rounded-[2.5rem] shadow-[0_0_60px_rgba(124,58,237,0.5)] w-full animate-in zoom-in-50 duration-700 ease-out-back relative group">
+                       <div className="bg-gradient-to-br from-white/10 to-black/40 rounded-[2.4rem] p-6 sm:p-8 border border-white/20 relative overflow-hidden">
+                           
+                           {/* Shimmer overlay */}
+                           <div className="absolute -top-[100%] -left-[100%] w-[300%] h-[300%] bg-gradient-to-r from-transparent via-white/20 to-transparent rotate-45 animate-[shimmer_4s_infinite_ease-in-out] pointer-events-none"></div>
 
-                          <button 
-                            onClick={continueGame}
-                            className="w-full bg-gradient-to-r from-yellow-500 to-orange-600 text-white font-black py-4 rounded-xl text-xl hover:shadow-orange-500/50 shadow-lg transition-all active:scale-95 flex items-center justify-center gap-2 group"
-                          >
-                              Next Order <span className="group-hover:translate-x-1 transition-transform">→</span>
-                          </button>
-                      </div>
-                  </div>
-              )}
-          </div>
-      );
+                           <div className="text-center mb-6">
+                               <div className="inline-block bg-gradient-to-r from-yellow-500 to-amber-600 text-white text-xs font-black tracking-[0.2em] uppercase px-4 py-1 rounded-full shadow-lg mb-4 border border-yellow-400/50">
+                                   {t('levelReward')} {gameState.level}
+                               </div>
+                               <h2 className="text-4xl sm:text-5xl font-black text-transparent bg-clip-text bg-gradient-to-br from-white via-yellow-200 to-amber-400 drop-shadow-sm mb-2">
+                                   {gameState.prize?.name}
+                               </h2>
+                           </div>
+
+                           {/* Image Container */}
+                           <div className="relative aspect-square w-full rounded-2xl overflow-hidden mb-6 shadow-2xl ring-1 ring-white/10 group-hover:shadow-[0_0_40px_rgba(251,191,36,0.4)] transition-all duration-500 bg-black/50">
+                               <img 
+                                   src={gameState.prize?.image} 
+                                   alt={gameState.prize?.name} 
+                                   className="w-full h-full object-cover transform transition-transform duration-[2s] hover:scale-110 hover:rotate-1" 
+                               />
+                               {/* Inner glow */}
+                               <div className="absolute inset-0 shadow-[inset_0_0_60px_rgba(0,0,0,0.6)] pointer-events-none"></div>
+                           </div>
+
+                           <p className={`text-blue-100 text-lg sm:text-xl font-medium leading-relaxed mb-8 drop-shadow-md italic border-yellow-400/50 bg-black/20 p-2 ${gameState.language === Language.HE ? 'border-r-4 rounded-l-lg text-right pr-4' : 'border-l-4 rounded-r-lg text-left pl-4'}`}>
+                               "{gameState.prize?.description}"
+                           </p>
+
+                           <button 
+                                onClick={continueGame}
+                                className="w-full relative overflow-hidden bg-gradient-to-r from-pink-500 via-purple-500 to-indigo-500 text-white font-black py-4 rounded-2xl text-xl shadow-[0_10px_20px_rgba(168,85,247,0.4)] hover:shadow-[0_10px_30px_rgba(168,85,247,0.6)] transition-all transform hover:-translate-y-1 active:translate-y-0 active:scale-95 flex items-center justify-center gap-3 group/btn"
+                           >
+                               <span className="relative z-10">{t('acceptPrize')}</span>
+                               <span className={`relative z-10 transition-transform ${gameState.language === Language.HE ? 'group-hover/btn:-translate-x-1 rotate-180' : 'group-hover/btn:translate-x-1'}`}>→</span>
+                               {/* Button shine */}
+                               <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/30 to-transparent -translate-x-[100%] group-hover/btn:translate-x-[100%] transition-transform duration-700 ease-in-out"></div>
+                           </button>
+                       </div>
+                   </div>
+               </div>
+           )}
+           
+           <style>{`
+            @keyframes burst {
+                0% { transform: translate(-50%, -50%) scale(0); opacity: 1; }
+                100% { transform: translate(-50%, -50%) scale(2); opacity: 0; }
+            }
+            @keyframes confetti-drop {
+                0% { transform: translateY(0) rotate(0deg); opacity: 1; }
+                100% { transform: translateY(100vh) rotate(720deg); opacity: 0; }
+            }
+            @keyframes shimmer {
+                0% { transform: translate(-50%, -50%) rotate(45deg); }
+                100% { transform: translate(50%, 50%) rotate(45deg); }
+            }
+           `}</style>
+       </div>
+     );
   }
 
   return (
@@ -641,8 +835,12 @@ const App: React.FC = () => {
         currentDonut={gameState.currentDonut} 
         updateDonut={updateDonut}
         gameState={gameState}
-        onServe={handleServe}
+        onServe={() => handleServe()}
         onTogglePause={togglePause}
+        onVolumeChange={handleVolumeChange}
+        onActivatePowerup={handlePowerup}
+        onLanguageChange={handleLanguageChange}
+        t={t}
       />
       
       <div className="absolute inset-0 z-0">

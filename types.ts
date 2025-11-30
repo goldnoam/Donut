@@ -1,3 +1,4 @@
+
 export enum DonutShape {
   RING = 'RING',
   FILLED = 'FILLED',
@@ -34,6 +35,23 @@ export enum Filling {
   LEMON = 'LEMON',
 }
 
+export enum PowerupType {
+  TIME_FREEZE = 'TIME_FREEZE',
+  DOUBLE_POINTS = 'DOUBLE_POINTS',
+  INSTANT_COOK = 'INSTANT_COOK',
+}
+
+export enum Language {
+  EN = 'en',
+  HE = 'he',
+  ES = 'es',
+  FR = 'fr',
+  ZH = 'zh',
+  RU = 'ru',
+  HI = 'hi',
+  DE = 'de',
+}
+
 export interface DonutConfig {
   shape: DonutShape;
   dough: DoughFlavor;
@@ -65,4 +83,10 @@ export interface GameState {
   pendingTimeBonus: number;
   bonusMessage: string | null;
   orderStartTime: number;
+  musicVolume: number;
+  language: Language;
+  // New features
+  isAppLoading: boolean;
+  inventory: Record<PowerupType, number>;
+  activeEffects: Record<PowerupType, number>; // timestamp when effect expires
 }
